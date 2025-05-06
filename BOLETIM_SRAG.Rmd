@@ -1,0 +1,1161 @@
+---
+title: "Análise epidemiológica SRAG"
+author: "José Santos"
+date: "02/05/2025"
+output:
+  word_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+    encoding: UTF-8
+params:
+  filtro_ano: [2024, 2025]
+  ano_epidemico: [2021]
+  ano_ref: 2025
+---
+```{r instalar pacotes, include=FALSE}
+# Lista de pacotes CRAN
+cran_packages <- c(
+  "tidyverse", "lubridate", "plotly", "forecast", "EpiEstim", "DT", "officer",
+  "rvg", "scales", "readxl", "purrr", "mem", "zoo", "stringi", "stringr","readxl"
+)
+
+# Instala apenas os pacotes que ainda não estão instalados
+to_install_cran <- cran_packages[!(cran_packages %in% installed.packages()[, "Package"])]
+if (length(to_install_cran) > 0) {
+  install.packages(to_install_cran)
+}
+
+# Instala devtools se necessário
+if (!requireNamespace("devtools", quietly = TRUE)) {
+  install.packages("devtools")
+}
+library(devtools)
+
+# Instala fmesher, se necessário
+if (!("fmesher" %in% installed.packages()[, "Package"])) {
+  install.packages("fmesher", repos = "https://inla.r-inla-download.org/R/stable")
+}
+
+```
+
+```{r carregar pacotes, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(lubridate)
+library(plotly)
+library(forecast)
+library(EpiEstim)
+library(DT)
+library(officer)
+library(rvg)
+library(scales)
+library(readxl)
+library(purrr)
+library(mem)
+library(zoo)
+library(devtools)
+library(fmesher)
+library(stringi)
+library(stringr)
+library(readxl)
+
+```
+
+```{r}
+
+# 🔠 Função para padronizar nomes (minúsculo, sem acento, sem espaços)
+padronizar_nomes <- function(x) {
+  x %>%
+    str_to_lower() %>%
+    stri_trans_general("Latin-ASCII") %>%
+    str_trim()
+}
+
+
+# Atualize os caminhos conforme necessário
+srag <-  read_excel("C:\\Users\\josel\\Downloads\\Leste\\Casos_SRAG_2020 a 2025_SE17.xlsx") %>%
+  mutate(
+    ID_MN_RESI_pad = ID_MN_RESI %>% tolower() %>% stringr::str_trim(),
+    ano = lubridate::year(DT_SIN_PRI),
+    SE = as.integer(SE)
+  ) %>%
+  filter(res_RS == "Leste", ID_MN_RESI_pad != "brasilia")
+
+pop <- read_excel("C:/Users/josel/Downloads/Leste/POP.xlsx") %>%
+  rename(
+    ano = Ano,
+    regiao = REG_ADM,
+    populacao = POP
+  ) %>%
+  mutate(ID_MN_RESI_pad = padronizar_nomes(regiao)) %>%
+  select(ano, ID_MN_RESI_pad, populacao) |>
+  mutate(ano = as.double(ano))
+
+
+```
+
+```{r }
+# Mapeamento dos nomes dos vírus
+virus_map <- c(
+  PCR_FLUASU = "Influenza A",
+  PCR_FLUBLI = "Influenza B",
+  PCR_SARS2  = "SARS-CoV-2",
+  PCR_VSR    = "Vírus Sincicial Respiratório",
+  PCR_PARA1  = "Parainfluenza 1",
+  PCR_PARA2  = "Parainfluenza 2",
+  PCR_PARA3  = "Parainfluenza 3",
+  PCR_PARA4  = "Parainfluenza 4",
+  PCR_ADENO  = "Adenovírus",
+  PCR_METAP  = "Metapneumovírus",
+  PCR_BOCA   = "Bocavírus",
+  PCR_RINO   = "Rinovírus",
+  PCR_OUTRO  = "Outro vírus respiratório"
+)
+
+
+# Ordenar idades
+niveis_idade  <- c("Menor de 2","2 a 10","11 a 19","20 a 29","30 a 39",
+                     "40 a 49","50 a 59","60 a 69","70 a 79","80 e mais")
+
+```
+
+# Visão geral dos casos de SRAG na região Leste
+
+```{r resumo_situacao}
+# Filtro do ano de interesse
+srag_filtrado <- srag %>% filter(ano == params$ano_ref)
+
+# Total de notificações
+total_notificacoes <- nrow(srag_filtrado)
+
+# Casos por semana
+casos_semanal <- srag_filtrado %>%
+  group_by(SE) %>%
+  summarise(casos = n(), .groups = "drop")
+
+# Média e desvio padrão
+media_casos <- mean(casos_semanal$casos, na.rm = TRUE)
+dp_casos <- sd(casos_semanal$casos, na.rm = TRUE)
+
+# Total de óbitos
+total_obitos <- sum(srag_filtrado$OBITOSRAG == "Sim", na.rm = TRUE)
+
+# Taxa de letalidade (%)
+taxa_letalidade <- (total_obitos / total_notificacoes) * 100
+
+# Exibir resumo
+tibble::tibble(
+  `Total de notificações` = total_notificacoes,
+  `Média semanal de casos` = round(media_casos, 1),
+  `Desvio padrão semanal` = round(dp_casos, 1),
+  `Total de óbitos` = total_obitos,
+  `Taxa de letalidade (%)` = round(taxa_letalidade, 1)
+) %>%
+  knitr::kable(caption = paste("Resumo da Situação Epidemiológica –", params$ano_ref))
+```
+
+
+```{r casos por ano ,fig.width=9, fig.height=6}
+df_1 <- srag %>%
+  filter(ano >= min(params$filtro_ano), ano <= max(params$filtro_ano)) %>%
+  group_by(ano, SE) %>%
+  summarise(casos = n(), .groups = "drop") %>%
+  complete(ano, SE = 1:53, fill = list(casos = 0)) %>%
+  arrange(ano, SE) %>%
+  mutate(
+    semana_id = row_number(),  # eixo X contínuo sequencial
+    ano_fator = factor(ano)
+  ) |>
+  filter(casos > 0)
+
+ggplot(df_1, aes(x = semana_id, y = casos)) +
+  geom_col(fill = "#1f77b4", width = 0.8) +
+  geom_vline(
+    data = df_1 %>% group_by(ano) %>% summarise(pos = max(semana_id)),
+    aes(xintercept = pos),
+    color = "gray50", linetype = "dotted"
+  ) +
+  scale_x_continuous(
+    breaks = df_1 %>% group_by(ano) %>% summarise(pos = mean(semana_id)) %>% pull(pos),
+    labels = levels(df_1$ano_fator),
+    expand = c(0, 0)
+  ) +
+  labs(
+    title = paste("Casos por Semana Epidemiológica e por ano, Região Leste,", params$filtro_ano),
+    x = "Ano",
+    y = "Número de Casos"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(face = "bold", color = "black"),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", color = "black")
+  )
+
+
+```
+
+## Vírus detectados
+
+```{r virus detectados, fig.width=9, fig.height=6}
+cols_pcr <- names(virus_map)
+
+df_tot <- srag %>%
+  filter(ano == params$ano_ref) %>%
+  select(all_of(cols_pcr)) %>%
+  pivot_longer(cols = everything(), names_to = "virus", values_to = "valor") %>%
+  filter(valor == 1) %>%
+  mutate(virus = virus_map[virus]) %>%
+  count(virus, name = "casos") %>%
+  mutate(
+    percentual = casos / sum(casos) * 100,
+    virus = fct_reorder(virus, casos)  # ordena pelo total
+  )
+
+ggplot(df_tot, aes(x = virus, y = casos)) +
+  geom_col(fill = "#4E79A7") +
+  geom_text(
+    aes(label = paste0(casos, " (", round(percentual, 1), "%)")),
+    vjust = -0.3, size = 5
+  ) +
+  labs(
+    title = paste("Proporção de Detecção por Vírus (PCR+), Região Leste,", params$ano_ref),
+    x = "Tipo de Vírus",
+    y = "Número de Registros"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+
+```
+
+
+```{r virus por SE, fig.width=9, fig.height=6}
+ cols_pcr <- names(virus_map)
+
+# 1. Base de casos positivos por SE e vírus
+df_week <- srag %>%
+  filter(ano == params$ano_ref) %>%
+  select(SE, all_of(cols_pcr)) %>%
+  mutate(SE = as.integer(SE)) %>%
+  pivot_longer(cols = -SE, names_to = "virus", values_to = "valor") %>%
+  filter(valor == 1) %>%
+  mutate(virus_nome = virus_map[virus]) %>%
+  group_by(SE, virus_nome) %>%
+  summarise(casos = n(), .groups = "drop")
+
+# 2. Calcular proporções totais por vírus
+proporcoes <- df_week %>%
+  group_by(virus_nome) %>%
+  summarise(total = sum(casos), .groups = "drop") %>%
+  mutate(percentual = total / sum(total) * 100) %>%
+  mutate(virus_legenda = paste0(virus_nome, " (", round(percentual, 1), "%)"))
+
+# 3. Juntar com base original para plotar
+df_week <- df_week %>%
+  left_join(proporcoes, by = "virus_nome")
+
+# 4. Gráfico com legenda formatada
+ggplot(df_week, aes(x = SE, y = casos, fill = virus_legenda)) +
+  geom_col() +
+  labs(
+    title = paste("Registros PCR por Semana Epidemiológica, Região Leste,", params$ano_ref),
+    x = "Semana Epidemiológica",
+    y = "Número de Registros",
+    fill = "Tipo de Vírus (Proporção)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 9),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+
+
+## Número de casos com correção,2025 (Ainda em teste)
+```{r numero de casos, eval=FALSE, fig.height=6, fig.width=9, include=FALSE}
+
+# 1. Garantir data correta
+srag_corr <- srag %>%
+  mutate(DT_DIGITA = as.Date(DT_DIGITA, format = "%d/%m/%Y"),
+         DT_SIN_PRI = as.Date(DT_SIN_PRI, format = "%d/%m/%Y"),
+         atraso_dias = as.integer(DT_DIGITA - DT_SIN_PRI),
+         semana_sintoma = isoweek(DT_SIN_PRI)) %>%
+  filter(!is.na(atraso_dias), atraso_dias >= 0, ano == params$ano_ref,)
+
+# 2. Base de semanas anteriores para calcular fator de correção
+semanas_recentes <- srag_corr %>%
+  count(semana_sintoma) %>%
+  arrange(desc(semana_sintoma)) %>%
+  slice(3:9) %>% pull(semana_sintoma)  # últimas semanas anteriores à última - 1
+
+# 3. Categorias de atraso
+categorias_atraso <- c("0d", "1sem", "2sem", "3sem", "4sem+")
+
+df_fator <- srag_corr %>%
+  filter(semana_sintoma %in% semanas_recentes) %>%
+  mutate(atraso_categoria = case_when(
+    atraso_dias == 0           ~ "0d",
+    atraso_dias <= 7           ~ "1sem",
+    atraso_dias <= 14          ~ "2sem",
+    atraso_dias <= 21          ~ "3sem",
+    TRUE                       ~ "4sem+"
+  )) %>%
+  mutate(atraso_categoria = factor(atraso_categoria, levels = categorias_atraso)) %>%
+  group_by(semana_sintoma, atraso_categoria) %>%
+  summarise(casos = n(), .groups = "drop") %>%
+  pivot_wider(names_from = atraso_categoria, values_from = casos, values_fill = 0, names_expand = TRUE) %>%
+  mutate(
+    total           = `0d` + `1sem` + `2sem` + `3sem` + `4sem+`,
+    acumulado_1sem  = `0d` + `1sem`,
+    fator_1sem      = total / acumulado_1sem
+  )
+
+# 4. Fator médio e desvio
+media_fator  <- mean(df_fator$fator_1sem, na.rm = TRUE)
+desvio_fator <- sd(df_fator$fator_1sem, na.rm = TRUE)
+
+# 5. Casos por semana
+df_grafico <- srag_corr %>%
+  group_by(semana_sintoma) %>%
+  summarise(observado = n(), .groups = "drop")
+
+# 6. Correção da última semana - 1
+se_corrigir <- sort(unique(srag_corr$semana_sintoma)) |> tail(2) |> head(1)
+
+casos_obs_semana <- srag_corr %>%
+  filter(semana_sintoma == se_corrigir, atraso_dias <= 7) %>%
+  summarise(obs = n()) %>% pull(obs)
+
+estimativa <- round(casos_obs_semana * media_fator, 0)
+ic_low     <- round(casos_obs_semana * (media_fator - desvio_fator), 0)
+ic_up      <- round(casos_obs_semana * (media_fator + desvio_fator), 0)
+
+# 7. Adicionar colunas de estimativa
+df_grafico <- df_grafico %>%
+  mutate(
+    estimado = if_else(semana_sintoma == se_corrigir, estimativa, NA_real_),
+    ic_low   = if_else(semana_sintoma == se_corrigir, ic_low, NA_real_),
+    ic_up    = if_else(semana_sintoma == se_corrigir, ic_up, NA_real_)
+  )
+
+# 8. GRÁFICO FINAL
+ggplot(df_grafico, aes(x = semana_sintoma)) +
+  geom_col(aes(y = observado), fill = "skyblue", width = 0.9) +
+  geom_ribbon(
+    data = filter(df_grafico, !is.na(estimado)),
+    aes(ymin = ic_low, ymax = ic_up),
+    fill = "gray60", alpha = 0.3
+  ) +
+  geom_line(
+    data = filter(df_grafico, !is.na(estimado)),
+    aes(y = estimado),
+    color = "red", linetype = "dashed", linewidth = 1.2
+  ) +
+  labs(
+    title = "Nowcasting – Correção por Atraso de Digitação",
+    subtitle = paste0("Correção aplicada na SE ", se_corrigir, " com base nos atrasos das semanas anteriores"),
+    x = "Semana Epidemiológica (sintomas)",
+    y = "Número de Casos"
+  ) +
+  theme_minimal(base_size = 13)
+
+# 9. TABELA DE ESTIMATIVA DA SEMANA CORRIGIDA
+df_tabela_nowcast <- tibble(
+  Semana_Estimada   = se_corrigir,
+  Observado_Atual   = casos_obs_semana,
+  Fator_Correcao    = round(media_fator, 2),
+  Estimado_Final    = estimativa,
+  IC_inferior       = ic_low,
+  IC_superior       = ic_up
+)
+
+df_tabela_nowcast
+```
+
+### Número de casos com correção por RA,2025
+
+```{r nowcasting por ra, eval=FALSE, fig.height=6, fig.width=9, include=FALSE}
+# Preparação dos dados para modelagem
+  df_11 <- srag %>%
+    filter(
+      !is.na(DT_SIN_PRI),
+      !is.na(DT_NOTIFIC),
+      !is.na(SE), 
+      ano == params$ano_ref
+    ) %>%
+    mutate(
+      atraso_dias = as.numeric(DT_NOTIFIC - DT_SIN_PRI),
+      SE_num = as.numeric(as.factor(SE)),
+      atraso_f = as.numeric(as.factor(atraso_dias)),
+      municipio = as.factor(ID_MN_RESI_pad)
+    ) %>%
+    count(SE, atraso_dias, municipio, name = "n") %>%
+    filter(
+      !is.na(n),
+      atraso_dias >= 0
+    ) %>%
+    mutate(
+      SE_num = as.numeric(as.factor(SE)),
+      atraso_f = as.numeric(as.factor(atraso_dias))
+    )
+  
+  # Verificação de tamanho mínimo
+  if (nrow(df_11) < 50) {
+    stop("Dados insuficientes para ajustar o modelo (apenas ", nrow(df_11), " observações).")
+  }
+  
+  # Fórmula do modelo
+  formula <- n ~ 
+    f(SE_num, model = "rw1") +
+    f(atraso_f, model = "rw1") +
+    f(municipio, model = "iid")
+  
+  # Ajuste do modelo com controles adicionais
+  modelo <- inla(
+    formula,
+    data = df_11,
+    family = "poisson",
+    control.predictor = list(compute = TRUE),
+    control.compute = list(config = TRUE),
+    control.fixed = list(prec.intercept = 0.001),
+    verbose = FALSE
+  )
+  
+  # Verificação do modelo
+  if (is.null(modelo$summary.fitted.values)) {
+    stop("O modelo não retornou valores ajustados.")
+  }
+  
+  # Preparação dos resultados
+  nowcast_ra <- df_11 %>%
+    mutate(
+      mean = modelo$summary.fitted.values$mean,
+      lower = modelo$summary.fitted.values$`0.025quant`,
+      upper = modelo$summary.fitted.values$`0.975quant`
+    ) %>%
+    group_by(SE, municipio) %>%
+    summarise(
+      estimado = sum(mean),
+      inf = sum(lower),
+      sup = sum(upper),
+      observado = sum(n),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      is_nowcast = SE %in% tail(sort(unique(SE)), 4),  # Últimas 4 semanas
+      tipo_linha = "Casos notificados",
+      tipo_modelo = if_else(is_nowcast, "Estimativa modelada", NA_character_),
+      tipo_faixa = if_else(is_nowcast, "Intervalo 95%", NA_character_)
+    )
+  
+  # Criação do gráfico
+  ggplot(nowcast_ra, aes(x = SE)) +
+    geom_ribbon(
+      data = filter(nowcast_ra, is_nowcast),
+      aes(ymin = inf, ymax = sup),
+      fill = "grey80", alpha = 0.3
+    ) +
+    geom_line(
+      data = filter(nowcast_ra, is_nowcast),
+      aes(y = estimado),
+      color = "red", linetype = "dotted", linewidth = 1
+    ) +
+    geom_line(
+      aes(y = observado),
+      color = "black", linetype = "solid", linewidth = 1
+    ) +
+    facet_wrap(~municipio, ncol = 2, scales = "free") +
+    labs(
+      title = "Nowcasting – Últimas 4 Semanas Epidemiológicas (2025)",
+      subtitle = "Região Leste (excluindo Brasília)",
+      x = "Semana Epidemiológica",
+      y = "Número de Casos"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "none",
+      strip.text = element_text(face = "bold"),
+      plot.subtitle = element_text(color = "gray40")
+    )
+```
+
+### Hospitalizações
+```{r hospitalizações, fig.width=9, fig.height=6}
+
+df_13 <- srag %>%
+  filter(!is.na(NM_UN_INTE), ano == params$ano_ref) %>%
+  group_by(NM_UN_INTE) %>%
+  summarise(casos = n(), .groups = "drop")
+
+ggplot(df_13, aes(x = casos, y = reorder(NM_UN_INTE, casos))) +
+  geom_col(fill = "forestgreen", alpha = 0.7) +
+  labs(
+    title = paste0("Hospitalizações por Unidade de Saúde, Reigão Leste", params$ano_ref),
+    x = "Casos",
+    y = "Unidade"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_text(size = 10))
+
+```
+
+
+### Faixa etária
+```{r faixa etaria, fig.width=9, fig.height=6}
+df_2 <- srag %>%
+      filter(!is.na(FE1) & ano == params$ano_ref) %>%
+      mutate(FE1 = factor(FE1, levels = niveis_idade)) %>%
+      group_by(FE1) %>%
+      summarise(casos = n(), .groups = "drop") %>%
+      mutate(percentual = round(casos / sum(casos) * 100, 1))
+
+# Criar gráfico de faixa etária
+
+  ggplot(df_2, aes(x = FE1, y = casos)) +
+      geom_col(fill = "#4E79A7") +
+      geom_text(aes(label = paste0(percentual, "%")),
+                position = position_stack(vjust = 0.5), size = 5) +
+      labs(title = paste("Percentual de casos de SRAG por Faixa Etária Região Leste,", params$ano_ref), x = "Faixa Etária", y = "Casos") +
+      theme_minimal() +
+      theme(legend.position = "none",
+            axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Menores de 2 anos
+
+```{r}
+# Filtrar apenas bebês com idade em dias (1) ou meses (2) e vírus positivo
+df_3 <- srag %>%
+  filter(TP_IDADE %in% c(1, 2), ano == params$ano_ref) %>%
+  select(TP_IDADE, NU_IDADE_N, starts_with("PCR_")) %>%
+  pivot_longer(cols = starts_with("PCR_"),
+               names_to = "virus_codigo",
+               values_to = "positivo") %>%
+  filter(positivo == 1) %>%
+  mutate(
+    Tipo = case_when(
+      TP_IDADE == 1 ~ "Dias",
+      TP_IDADE == 2 ~ "Meses"
+    ),
+    virus_nome = virus_map[virus_codigo],
+    virus_nome = iconv(virus_nome, from = "", to = "UTF-8")  # <-- aqui!
+  ) %>%
+  drop_na(virus_nome)
+
+
+# Calcular proporção por idade e tipo
+df_3_prop <- df_3 %>%
+  group_by(Tipo, NU_IDADE_N) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Tipo) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+ggplot(df_3_prop, aes(x = NU_IDADE_N, y = prop)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = scales::percent(prop, accuracy = 0.1)),
+            vjust = -0.3, size = 3) +
+  facet_wrap(~Tipo, scales = "free") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = paste("Proporção de bebês com SRAG por idade, Região Leste,",params$ano_ref),
+    x = "Idade",
+    y = "Proporção de casos"
+  ) +
+  theme_minimal()
+
+```
+
+```{r vírus por bebês, fig.width=9, fig.height=6}
+df_virus <- df_3 %>%
+  group_by(Tipo, NU_IDADE_N, virus_nome) %>%
+  summarise(n = n(), .groups = "drop")
+
+ggplot(df_virus, aes(x = NU_IDADE_N, y = n, fill = virus_nome)) +
+  geom_col() +  # stack é o padrão
+  facet_wrap(~Tipo, scales = "free") +
+  labs(
+    title = paste("Distribuição de vírus entre bebês com SRAG, Região Leste", params$ano_ref),
+    x = "Idade",
+    y = "Número de casos",
+    fill = "Vírus detectado"
+  ) +
+  theme_minimal()
+
+```
+
+### Uso de ventilação
+
+```{r ventilação, fig.width=9, fig.height=6}
+ df_4 <- srag %>%
+  filter(ano == params$ano_ref) |>
+      count(SUPORT_VEN2) %>%
+      rename(casos = n) %>%
+      mutate(percentual = round(casos / sum(casos) * 100, 1))
+    
+  ggplot(df_4, aes(x = SUPORT_VEN2, y = casos)) +
+      geom_col(fill = "#E15759") +
+      geom_text(aes(label = paste0(percentual, "%")),
+                position = position_stack(vjust = 0.5), size = 5) +
+      labs(title = paste("Percentual de internação com Suporte Ventilatório, Região Leste,",params$ano_ref), x = "Tipo de Suporte", y = "Casos") +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.position = "none")
+    
+```
+
+### Óbitos
+
+```{r óbitos, fig.width=9, fig.height=6}
+df_5 <- srag%>%
+  filter(ano == params$ano_ref) |>
+      group_by(ano, SE) %>%
+      summarise(obitos = sum(OBITOSRAG == "Sim", na.rm = TRUE), .groups = "drop")
+  
+   ggplot(df_5, aes(x =SE, y = obitos)) +
+      geom_col(fill = "red") +
+      labs(title = paste("Número óbitos por Semana Epidemiológica, Região Leste,",params$ano_ref), x = "Ano", y = "Óbitos") +
+      theme_minimal()
+  # Tabela com SE, vírus, faixa etária e número de óbitos
+tabela_obitos <- srag %>%
+  filter(OBITOSRAG == "Sim", !is.na(FE1), ano == params$ano_ref) %>%
+  select(SE,ID_MN_RESI_pad ,FE1, starts_with("PCR_")) %>%
+  pivot_longer(cols = starts_with("PCR_"),
+               names_to = "virus_codigo",
+               values_to = "positivo") %>%
+  filter(positivo == 1) %>%
+  mutate(
+    virus_nome = virus_map[virus_codigo],
+    virus_nome = iconv(virus_nome, from = "", to = "UTF-8"),
+    FE1 = factor(FE1, levels = niveis_idade),
+    Regiao_Administrativa = as.factor(ID_MN_RESI_pad)
+  ) %>%
+  drop_na(virus_nome) %>%
+  group_by(SE, virus_nome, FE1,Regiao_Administrativa) %>%
+  summarise(obitos = n(), .groups = "drop")
+
+# Exibir a tabela (em HTML)
+if (knitr::is_html_output()) {
+  DT::datatable(
+    tabela_obitos,
+    caption = "Óbitos por Semana Epidemiológica, Tipo de Vírus e Faixa Etária",
+    rownames = FALSE,
+    options = list(pageLength = 10, scrollX = TRUE)
+  )
+} else {
+  knitr::kable(
+    tabela_obitos,
+    caption = "Óbitos por Semana Epidemiológica, Tipo de Vírus e Faixa Etária"
+  )
+}
+
+
+```
+
+### Internação por faixa etária
+
+```{r internação, fig.width=9, fig.height=6}
+df_6 <- srag %>%
+      filter(!is.na(Tempo_Evolucao), !is.na(FE1), ano == params$ano_ref) %>%
+      # garante a ordem correta das faixas
+      mutate(FE1 = factor(FE1, levels = niveis_idade))
+    
+  ggplot(df_6, aes(x = FE1, y = Tempo_Evolucao)) +
+      geom_boxplot(fill = "#59A14F") +
+      labs(
+        title = paste("Tempo de Internação (dias) por Faixa Etária",params$ano_ref),
+        x     = "Faixa Etária",
+        y     = "Dias"
+      ) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Internação por tipo de vírus
+
+```{r internação por tipo de vírus, fig.width=9, fig.height=6}
+df_7 <- srag %>%
+  filter(!is.na(Tempo_Evolucao), ano == params$ano_ref) %>%
+  select(Tempo_Evolucao, starts_with("PCR_")) %>%
+  pivot_longer(cols = starts_with("PCR_"),
+               names_to = "virus_codigo",
+               values_to = "positivo") %>%
+  filter(positivo == 1) %>%
+  mutate(virus_nome = virus_map[virus_codigo]) %>%
+  drop_na(virus_nome) %>%
+  mutate(virus_nome = iconv(virus_nome, from = "", to = "UTF-8"))
+
+    
+  ggplot(df_7, aes(x = virus_nome, y = Tempo_Evolucao)) +
+  geom_boxplot(fill = "#4E79A7") +
+  labs(
+    title = "Tempo de Internação (dias) por Tipo de Vírus",
+    x     = "Vírus Detectado",
+    y     = "Dias de Internação"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+### Teste de tempo de internação por faixa etária e tipo de vírus, 2025
+
+```{r internação por faixa etaria e virus, fig.width=9, fig.height=6}
+df_8 <- srag %>%
+  filter(!is.na(Tempo_Evolucao), !is.na(FE1), ano == params$ano_ref) %>%
+  select(FE1, Tempo_Evolucao, starts_with("PCR_")) %>%
+  pivot_longer(cols = starts_with("PCR_"),
+               names_to = "virus_codigo",
+               values_to = "positivo") %>%
+  filter(positivo == 1) %>%
+  mutate(
+    FE1 = factor(FE1, levels = niveis_idade),
+    virus_nome = virus_map[virus_codigo],
+    virus_nome = iconv(virus_nome, from = "", to = "UTF-8")
+  ) %>%
+  drop_na(virus_nome)
+
+ggplot(df_8, aes(x = FE1, y = Tempo_Evolucao, fill = virus_nome)) +
+  geom_boxplot() +
+  facet_wrap(~virus_nome, scales = "free") +
+  labs(
+    title = "Tempo de Internação (dias) por Vírus e Faixa Etária",
+    x     = "Vírus Detectado",
+    y     = "Dias de Internação"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+
+```
+
+### Evolução
+
+```{r evolução, fig.width=9, fig.height=6}
+df_9 <- srag%>%
+      filter(!is.na(EVOL1), ano == params$ano_ref) %>%
+      group_by(EVOL1) %>% summarise(casos=n(), .groups="drop") |>
+      mutate(percentual = round(casos / sum(casos) * 100, 1))
+
+  ggplot(df_9, aes(x=reorder(EVOL1, casos), y=casos)) +
+      geom_col(fill="#F28E2B") +
+    geom_text(aes(label = paste0(percentual, "%")),
+                position = position_stack(vjust = 0.5), size = 5) +
+      labs(title=paste("Percentual de internação por tipo de evolução",params$ano_ref), x="Desfecho", y="Casos") +
+      theme_minimal() + theme(legend.position="none")
+```
+
+## Diagrama de controle de SRAG 
+```{r diagrama de controle Leste, fig.width=9, fig.height=6}
+anos_hist <- (params$ano_ref - 10):(params$ano_ref - 1)
+
+# Juntar com população correta
+df_10 <- srag %>%
+  left_join(pop, by = c("ano", "ID_MN_RESI_pad")) %>%
+  filter(!is.na(populacao)) %>%
+  mutate(incidencia = 100000 / populacao)  # 1 caso por linha
+
+# Histórico
+historico <- df_10 %>%
+   filter(ano %in% anos_hist, !ano %in% params$ano_epidemico) %>%
+  group_by(SE, ano) %>%
+  summarise(casos = n(), pop = mean(populacao), .groups = "drop") %>%
+  mutate(inc = 100000 * casos / pop)
+
+limiares <- historico %>%
+  group_by(SE) %>%
+  summarise(
+    media = mean(inc),
+    sd = sd(inc),
+    lim_1 = media + sd,
+    lim_2 = media + 2 * sd,
+    lim_3 = media + 3 * sd,
+    .groups = "drop"
+  )
+
+# Dados atuais (ano de referência)
+atual <- df_10 %>%
+  filter(ano == params$ano_ref) %>%
+  group_by(SE) %>%
+  summarise(casos = n(), pop = mean(populacao), .groups = "drop") %>%
+  mutate(inc = 100000 * casos / pop)
+
+
+#Nowcasting dos casos
+
+# Calcular a média móvel (lag = 1, para não usar valores futuros)
+atual <- atual %>%
+  arrange(SE) %>%
+  mutate(
+    inc_ma = rollmean(inc, k = 4, align = "right", fill = NA)
+  )
+
+# Última SE registrada no ano de referência
+ultima_SE <- max(atual$SE, na.rm = TRUE)
+
+# Fator de correção fixo (exemplo: 1.2). Você pode usar um params$nowcast_fator se quiser.
+fator_nowcasting <- 1.2
+
+# Corrigir nas 4 últimas semanas com base na média móvel
+nowcast <- atual %>%
+  filter(SE >= (ultima_SE - 7), SE <= ultima_SE) %>%
+  mutate(
+    inc_corrigida = inc_ma,
+    ic_low = inc_corrigida * 0.9,
+    ic_up  = inc_corrigida * 1.1
+  ) %>%
+  drop_na(inc_corrigida)
+
+
+# Gráfico
+# 🖼 Gráfico com legenda
+ggplot() +
+  geom_ribbon(data = limiares, aes(x = SE, ymin = 0, ymax = media, fill = "Zona de controle"), alpha = 0.3) +
+  geom_ribbon(data = limiares, aes(x = SE, ymin = media, ymax = lim_1, fill = "Zona de segurança"), alpha = 0.3) +
+  geom_ribbon(data = limiares, aes(x = SE, ymin = lim_1, ymax = lim_2, fill = "Zona de alerta"), alpha = 0.3) +
+  geom_ribbon(data = limiares, aes(x = SE, ymin = lim_2, ymax = lim_3, fill = "Zona epidêmica"), alpha = 0.3) +
+
+  geom_line(data = atual, aes(x = SE, y = inc, color = "Incidencia atual"), size = 1.2) +
+
+  # Nowcasting
+  geom_ribbon(data = nowcast, aes(x = SE, ymin = ic_low, ymax = ic_up),
+            fill = "gray50", alpha = 0.3) +
+geom_line(data = nowcast, aes(x = SE, y = inc_corrigida, color = "Incidencia corrigida"),
+          linetype = "dashed", linewidth = 1.2)+
+
+
+  labs(
+    title = paste("Diagrama de Controle de SRAG, Região Leste -", params$ano_ref),
+    x = "Semana Epidemiológica",
+    y = "Incidência por 100 mil hab.",
+    fill = "Faixas de risco",
+    color = ""
+  ) +
+  scale_fill_manual(
+  values = c(
+      "Zona de controle" = "green",
+      "Zona de segurança" = "yellow",
+      "Zona de alerta" = "orange",
+      "Zona epidêmica" = "red"
+  ),
+   breaks = c("Zona de controle", "Zona de segurança", "Zona de alerta", "Zona epidêmica")
+)+
+  scale_color_manual(values = c("Incidencia atual" = "blue", "Incidencia corrigida" = "red")) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+```
+
+### Diagrama de controle por RA
+
+```{r Diagrama de controle por RA, fig.width=9, fig.height=6}
+
+# Preparar base com incidência (como antes)
+df_ra <- srag %>%
+  left_join(pop, by = c("ano", "ID_MN_RESI_pad")) %>%
+  filter(!is.na(populacao)) %>%
+  mutate(incidencia = 100000 / populacao)
+
+# Anos de histórico (excluindo anos epidêmicos)
+anos_hist <- (params$ano_ref - 10):(params$ano_ref - 1)
+anos_hist <- setdiff(anos_hist, params$ano_epidemico)
+
+# Limiares por RA
+historico_ra <- df_ra %>%
+  filter(ano %in% anos_hist) %>%
+  group_by(SE, ID_MN_RESI_pad, ano) %>%  # <-- adiciona o ano
+  summarise(casos = n(), pop = mean(populacao), .groups = "drop") %>%
+  mutate(inc = 100000 * casos / pop)
+
+
+limiares_ra <- historico_ra %>%
+  group_by(SE, ID_MN_RESI_pad) %>%
+  summarise(
+    media = mean(inc),
+    sd = sd(inc),
+    lim_1 = media + sd,
+    lim_2 = media + 2 * sd,
+    lim_3 = media + 3 * sd,
+    .groups = "drop"
+  )
+
+
+# Dados atuais
+atual_ra <- df_ra %>%
+  filter(ano == params$ano_ref) %>%
+  group_by(SE, ID_MN_RESI_pad) %>%
+  summarise(casos = n(), pop = mean(populacao), .groups = "drop") %>%
+  mutate(inc = 100000 * casos / pop) %>%
+  arrange(ID_MN_RESI_pad, SE) %>%
+  group_by(ID_MN_RESI_pad) %>%
+  mutate(inc_ma = zoo::rollmean(inc, k = 4, align = "right", fill = NA)) %>%
+  ungroup()
+
+# Últimas 5 semanas por RA
+ultima_SE <- max(atual_ra$SE, na.rm = TRUE)
+
+nowcast_ra <- atual_ra %>%
+  filter(SE >= (ultima_SE - 7), SE <= ultima_SE) %>%
+  mutate(
+    inc_corrigida = inc_ma,
+    ic_low = inc_corrigida * 0.9,
+    ic_up  = inc_corrigida * 1.1
+  ) %>%
+  drop_na(inc_corrigida)
+
+# Gráfico facetado por Região Administrativa
+ggplot() +
+  geom_ribbon(data = limiares_ra, aes(x = SE, ymin = 0, ymax = media, fill = "Zona de controle"), alpha = 0.3) +
+  geom_ribbon(data = limiares_ra, aes(x = SE, ymin = media, ymax = lim_1, fill = "Zona de segurança"), alpha = 0.3) +
+  geom_ribbon(data = limiares_ra, aes(x = SE, ymin = lim_1, ymax = lim_2, fill = "Zona de alerta"), alpha = 0.3) +
+  geom_ribbon(data = limiares_ra, aes(x = SE, ymin = lim_2, ymax = lim_3, fill = "Zona epidêmica"), alpha = 0.3) +
+
+  geom_line(data = atual_ra, aes(x = SE, y = inc, color = "Incidencia atual"), linewidth = 1) +
+
+  geom_ribbon(data = nowcast_ra, aes(x = SE, ymin = ic_low, ymax = ic_up), fill = "gray50", alpha = 0.3) +
+  geom_line(data = nowcast_ra, aes(x = SE, y = inc_corrigida, color = "Incidência corrigida"), 
+            linetype = "dashed", linewidth = 1.1) +
+
+  facet_wrap(~ID_MN_RESI_pad, scales = "free_y") +
+
+  scale_fill_manual(
+    values = c(
+      "Zona de controle" = "green",
+      "Zona de segurança" = "yellow",
+      "Zona de alerta" = "orange",
+      "Zona epidêmica" = "red"
+    ),
+    breaks = c("Zona de controle", "Zona de segurança", "Zona de alerta", "Zona epidêmica")
+  ) +
+  scale_color_manual(values = c(
+    "Incidencia atual" = "blue",
+    "Média móvel" = "red"
+  )) +
+  labs(
+    title = paste("Diagramas de Controle de SRAG por Região Administrativa -", params$ano_ref),
+    x = "Semana Epidemiológica",
+    y = "Incidência por 100 mil hab.",
+    fill = "Faixas de risco",
+    color = ""
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    strip.text = element_text(face = "bold", size = 9)
+  )
+
+```
+
+# Taxa de transmissibilidade viral
+```{r DT, fig.width=9, fig.height=6}
+# 1. Filtrar apenas vírus positivos e formatar base
+df_rt_virus <- srag %>%
+  filter(ano == params$ano_ref) %>%
+  select(ID_MN_RESI_pad, SE, starts_with("PCR_")) %>%
+  pivot_longer(cols = starts_with("PCR_"),
+               names_to = "virus_codigo",
+               values_to = "positivo") %>%
+  filter(positivo == 1, virus_codigo !="PCR_RESUL")
+
+# 2. Identificar todos os vírus positivos únicos
+virus_unicos <- unique(df_rt_virus$virus_codigo)
+
+# 3. Função para calcular Rt por vírus e município
+calcular_rt <- function(df, grupo_regiao) {
+  purrr::map_dfr(virus_unicos, function(v) {
+    df_sub <- df %>%
+      filter(virus_codigo == v, ID_MN_RESI_pad %in% grupo_regiao) %>%
+      group_by(ID_MN_RESI_pad, SE) %>%
+      summarise(casos = n(), .groups = "drop") %>%
+      arrange(ID_MN_RESI_pad, SE)
+
+    purrr::map_dfr(unique(df_sub$ID_MN_RESI_pad), function(reg) {
+      serie <- df_sub %>% filter(ID_MN_RESI_pad == reg)
+      if (nrow(serie) < 2 || sum(serie$casos) < 3) return(NULL)
+      conf <- EpiEstim::make_config(list(mean_si = 3, std_si = 1.5))
+      est <- tryCatch(
+        EpiEstim::estimate_R(incid = serie$casos, method = "parametric_si", config = conf),
+        error = function(e) return(NULL)
+      )
+      if (is.null(est)) return(NULL)
+      tibble(
+        ID_MN_RESI_pad = reg,
+        virus_codigo   = v,
+        virus_nome = if (v %in% names(virus_map)) virus_map[[v]] else v,
+        SE             = serie$SE[est$R$t_end],
+        Rt             = est$R$`Mean(R)`,
+        lower          = est$R$`Quantile.0.025(R)`,
+        upper          = est$R$`Quantile.0.975(R)`
+      )
+    })
+  })
+}
+
+
+# Gráfico 1: geral da região Leste
+df_rt_leste <- calcular_rt(df_rt_virus, grupo_regiao = unique(srag$ID_MN_RESI_pad))
+
+# Últimos valores por vírus
+labels_rt <- df_rt_leste %>%
+  group_by(virus_nome) %>%
+  filter(SE == max(SE)) %>%
+  ungroup()
+
+# Gráfico com rótulos finais
+ggplot(df_rt_leste, aes(x = SE, y = Rt)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "red", alpha = 0.2) +
+  geom_line(color = "red", linewidth = 0.9) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_text(data = labels_rt,
+            aes(label = sprintf("Rt = %.2f", Rt)),
+            vjust = -0.6, size = 3, color = "black") +
+  facet_wrap(~ virus_nome, scales = "free_y") +
+  labs(
+    title = paste("taxa de transmissibilidade por Vírus – Região Leste,",params$ano_re),
+    x = "Semana",
+    y = "Rt"
+  ) +
+  theme_minimal()
+
+excluidos <- df_rt_virus %>%
+  group_by(virus_codigo) %>%
+  summarise(n_casos = n()) %>%
+  filter(!virus_codigo %in% unique(df_rt_leste$virus_codigo))
+knitr::kable(excluidos, caption = "Vírus com dados insuficientes para cálculo do Rt")
+
+
+```
+### Gráfico 2: Paranoá
+```{r, fig.width=9, fig.height=6}
+# Gráfico 2: Paranoá
+df_rt_paranoa <- calcular_rt(df_rt_virus, grupo_regiao = "paranoa")
+
+labels_regionais <- df_rt_paranoa %>%
+  group_by(virus_nome) %>%
+  filter(SE == max(SE)) %>%
+  ungroup()
+
+
+ggplot(df_rt_paranoa, aes(x = SE, y = Rt)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "blue", alpha = 0.2) +
+  geom_line(color = "blue", linewidth = 0.9) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_text(data = labels_regionais,
+            aes(label = sprintf("Rt = %.2f", Rt)),
+            vjust = -0.6, size = 3, color = "black") +
+  facet_wrap(~ virus_nome, scales = "free_y") +
+  labs(
+    title = paste("taxa de transmissibilidade por Vírus – Paranoá,",params$ano_re),
+    x = "Semana",
+    y = "Rt"
+  ) +
+  theme_minimal()
+
+```
+### Gráfico 3: São Sebastião
+```{r, fig.width=9, fig.height=6}
+# Gráfico 3: São Sebastião
+df_rt_sseb <- calcular_rt(df_rt_virus, grupo_regiao = "sao sebastiao")
+
+labels_regionais <- df_rt_sseb %>%
+  group_by(virus_nome) %>%
+  filter(SE == max(SE)) %>%
+  ungroup()
+
+ggplot(df_rt_sseb, aes(x = SE, y = Rt)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "purple", alpha = 0.2) +
+  geom_line(color = "purple", linewidth = 0.9) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_text(data = labels_regionais,
+            aes(label = sprintf("Rt = %.2f", Rt)),
+            vjust = -0.6, size = 3, color = "black") +
+  facet_wrap(~ virus_nome, scales = "free_y") +
+  labs(
+    title = paste("taxa de transmissibilidade por Vírus – São Sebastião,",params$ano_re),
+    x = "Semana",
+    y = "Rt"
+  ) +
+  theme_minimal()
+
+```
+
+### Gráfico 4: Jardim Botânico
+```{r, fig.width=9, fig.height=6}
+# Gráfico 4: Jardim Botânico
+tryCatch({
+  df_rt_jbot <- calcular_rt(df_rt_virus, grupo_regiao = "jardim botanico")
+  
+  if (nrow(df_rt_jbot) == 0) {
+    stop("Nenhum dado suficiente para estimar Rt em Jardim Botânico.")
+  }
+  
+  labels_regionais <- df_rt_jbot %>%
+    group_by(virus_nome) %>%
+    filter(SE == max(SE)) %>%
+    ungroup()
+
+  ggplot(df_rt_jbot, aes(x = SE, y = Rt)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = "darkgreen", alpha = 0.2) +
+    geom_line(color = "darkgreen", linewidth = 0.9) +
+    geom_hline(yintercept = 1, linetype = "dashed") +
+    geom_text(data = labels_regionais,
+              aes(label = sprintf("Rt = %.2f", Rt)),
+              vjust = -0.6, size = 3, color = "black") +
+    facet_wrap(~ virus_nome, scales = "free_y") +
+    labs(
+      title = paste("taxa de transmissibilidade por Vírus – Jardim Botânico,",params$ano_re),
+      x = "Semana",
+      y = "Rt"
+    ) +
+    theme_minimal()
+  
+}, error = function(e) {
+  message("⚠️ Não foi possível gerar o gráfico de Rt para Jardim Botânico: ", e$message)
+})
+
+
+
+```
+
+### Gráfico 5: Itapoã
+```{r, fig.width=9, fig.height=6}
+# Gráfico 5: Itapoã
+df_rt_itapoa <- calcular_rt(df_rt_virus, grupo_regiao = "itapoa")
+
+labels_regionais <- df_rt_itapoa %>%
+  group_by(virus_nome) %>%
+  filter(SE == max(SE)) %>%
+  ungroup()
+
+ggplot(df_rt_itapoa, aes(x = SE, y = Rt)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "orange", alpha = 0.2) +
+  geom_line(color = "orange", linewidth = 0.9) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_text(data = labels_regionais,
+            aes(label = sprintf("Rt = %.2f", Rt)),
+            vjust = -0.6, size = 3, color = "black") +
+  facet_wrap(~ virus_nome, scales = "free_y") +
+  labs(
+    title = paste("taxa de transmissibilidade por Vírus – Itapoã,",params$ano_re),
+    x = "Semana",
+    y = "Rt"
+  ) +
+  theme_minimal()
+
+
+```
+
